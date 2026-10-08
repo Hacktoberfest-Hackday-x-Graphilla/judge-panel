@@ -2,24 +2,42 @@
  * THE PITCH COURT — backend
  * POST /api/judge  { pitchText }  ->  { judges: [...with base64 audio], verdict: {...} }
  *
- * Stack: Express + Groq (LLM, one call for all 3 judges) + ElevenLabs (TTS, sequential)
+ * Stack: Express + Gemma 4 via Gemini API (or Groq) for the critiques, one call for all 3 judges, + ElevenLabs (TTS, sequential)
  * Requires Node 18+ (uses built-in fetch).
  */
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 // ─────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // Google AI Studio key (used for Gemma 4)
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
-// NOTE: llama-3.1-70b-versatile has been retired by Groq.
-// llama-3.3-70b-versatile is its direct successor. Override via GROQ_MODEL if needed.
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// Prefer the more stable provider by default, but keep a fallback chain so one flaky API
+// does not take the whole app down. Force a specific one with LLM_PROVIDER=gemma or LLM_PROVIDER=groq in .env.
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || (GROQ_API_KEY ? "groq" : "gemma")).toLowerCase();
+const LLM_PROVIDER_PRIORITY = process.env.LLM_PROVIDER
+  ? [LLM_PROVIDER]
+  : [LLM_PROVIDER, LLM_PROVIDER === "gemma" ? "groq" : "gemma"].filter((provider, index, list) => list.indexOf(provider) === index);
+
+// Gemma 4 via the Gemini API. Two hosted variants exist: gemma-4-31b-it (better writing)
+// and gemma-4-26b-a4b-it (faster). Override with GEMMA_MODEL in .env.
+const GEMMA_MODEL = process.env.GEMMA_MODEL || "gemma-4-31b-it";
+
+// NOTE: Groq retired llama-3.1-70b-versatile AND llama-3.3-70b-versatile (shut down 2026-08-16).
+// openai/gpt-oss-120b is Groq's recommended production replacement.
+// Override via GROQ_MODEL in .env if Groq changes things again (see console.groq.com/docs/models).
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+
+const LLM_MODEL = LLM_PROVIDER === "gemma" ? GEMMA_MODEL : GROQ_MODEL;
+const LLM_KEY = LLM_PROVIDER === "gemma" ? GEMINI_API_KEY : GROQ_API_KEY;
 
 // Flash model = half the credit cost per character, which stretches the free tier.
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "eleven_flash_v2_5";
@@ -29,9 +47,10 @@ const MIN_PITCH_CHARS = 20;
 const MAX_PITCH_CHARS = 3000;
 const MAX_SPOKEN_CHARS = 450; // hard cap per judge to protect free-tier credits
 
-if (!GROQ_API_KEY || !ELEVENLABS_API_KEY) {
+if (!LLM_KEY || !ELEVENLABS_API_KEY) {
   console.warn(
-    "⚠️  Missing GROQ_API_KEY and/or ELEVENLABS_API_KEY. Copy .env.example to .env and fill them in."
+    `⚠️  Missing ${LLM_PROVIDER === "gemma" ? "GEMINI_API_KEY" : "GROQ_API_KEY"} and/or ELEVENLABS_API_KEY. ` +
+      "Copy .env.example to .env and fill them in."
   );
 }
 
@@ -54,7 +73,7 @@ const JUDGES = [
     id: "aris",
     name: "Dr. Aris Thorne",
     title: "The Tech Purist",
-    voiceId: process.env.ARIS_VOICE_ID || "ErXwobaYiN019PkySvjV", // Antoni — crisp, analytical
+    voiceId: process.env.ARIS_VOICE_ID || "IKne3meq5aSn9XLyUdCD", // Charlie — crisp, analytical
     voiceSettings: { stability: 0.5, similarity_boost: 0.8, style: 0.2 },
     persona:
       "Pedantic principal engineer with a PhD. Obsessed with architectural flaws, tech stack choices, scalability, security vulnerabilities, and technical debt. Dry, surgical, quietly horrified by buzzwords like 'AI-powered' and 'blockchain'.",
@@ -63,7 +82,7 @@ const JUDGES = [
     id: "chloe",
     name: "Chloe Chen",
     title: "The Viral Wildcard",
-    voiceId: process.env.CHLOE_VOICE_ID || "AZnzlk1XvdvUeBnXmlld", // Domi — energetic, punchy
+    voiceId: process.env.CHLOE_VOICE_ID || "TX3LPaxmHKxFdv7VOQHJ", // Liam — energetic, punchy
     voiceSettings: { stability: 0.35, similarity_boost: 0.75, style: 0.6 },
     persona:
       "Chaotic brand strategist and social-media-native creator. Focused on branding, memeability, absurdity, humor, and whether it would go viral on TikTok. Fast-talking, uses slang and hyperbole, roasts the name and logo first.",
@@ -121,7 +140,10 @@ async function callGroq(pitchText) {
     body: JSON.stringify({
       model: GROQ_MODEL,
       temperature: 0.9,
-      max_tokens: 1400,
+      // Reasoning models (gpt-oss) spend part of this budget "thinking", so keep it generous.
+      max_completion_tokens: 4000,
+      // Keep thinking short so the demo stays fast. Only sent to models that support it.
+      ...(GROQ_MODEL.includes("gpt-oss") ? { reasoning_effort: "low" } : {}),
       response_format: { type: "json_object" }, // forces syntactically valid JSON
       messages: [
         { role: "system", content: buildSystemPrompt() },
@@ -147,6 +169,124 @@ async function callGroq(pitchText) {
   return content;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Gemma 4 (via the Gemini API / Google AI Studio key)
+// ─────────────────────────────────────────────────────────────
+const JUDGEMENT_SCHEMA = {
+  type: "object",
+  properties: {
+    judges: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string", enum: ["victor", "aris", "chloe"] },
+          critique: { type: "string" },
+          roast: { type: "string" },
+          score: { type: "integer" },
+        },
+        required: ["id", "critique", "roast", "score"],
+      },
+    },
+    verdict: {
+      type: "object",
+      properties: {
+        score: { type: "integer" },
+        ruling: { type: "string" },
+        takeaways: { type: "array", items: { type: "string" } },
+      },
+      required: ["score", "ruling", "takeaways"],
+    },
+  },
+  required: ["judges", "verdict"],
+};
+
+/**
+ * strict = true : system instruction + JSON schema enforcement (preferred).
+ * strict = false: fallback if the API rejects those fields for this model — the system prompt
+ *                 is folded into the user message and we rely on the prompt + tolerant parsing.
+ */
+async function callGemma(pitchText, strict = true) {
+  const userText = `Here is the pitch. Judge it.\n\n<pitch>\n${pitchText}\n</pitch>`;
+
+  const body = strict
+    ? {
+        systemInstruction: { parts: [{ text: buildSystemPrompt() }] },
+        contents: [{ role: "user", parts: [{ text: userText }] }],
+        generationConfig: {
+          temperature: 0.9,
+          maxOutputTokens: 4000, // generous: Gemma 4 may "think" before answering
+          responseMimeType: "application/json",
+          responseJsonSchema: JUDGEMENT_SCHEMA,
+        },
+      }
+    : {
+        contents: [{ role: "user", parts: [{ text: `${buildSystemPrompt()}\n\n${userText}` }] }],
+        generationConfig: { temperature: 0.9, maxOutputTokens: 4000 },
+      };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMMA_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+      body: JSON.stringify(body),
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    // A 400 in strict mode is often "this model doesn't accept that field" — retry the plain way once.
+    // (An invalid API key also returns 400; the retry fails the same way and the error surfaces.)
+    if (res.status === 400 && strict) {
+      console.warn(`Gemma strict mode rejected (${text.slice(0, 160)}) — retrying without schema.`);
+      return callGemma(pitchText, false);
+    }
+    const err = new Error(`Gemma API error ${res.status}: ${text.slice(0, 300)}`);
+    err.status = res.status;
+    err.source = "gemma";
+    throw err;
+  }
+
+  const data = await res.json();
+  // Skip any "thought" parts; keep only the real answer text.
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const content = parts
+    .filter((p) => !p.thought && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("");
+
+  if (!content) {
+    const why = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || "unknown";
+    throw new Error(`Gemma returned no text (reason: ${why})`);
+  }
+  return content;
+}
+
+async function callLLM(pitchText) {
+  const candidates = LLM_PROVIDER_PRIORITY.filter((provider) => {
+    if (provider === "gemma") return Boolean(GEMINI_API_KEY);
+    if (provider === "groq") return Boolean(GROQ_API_KEY);
+    return false;
+  });
+
+  if (!candidates.length) {
+    throw new Error("No LLM provider is configured. Check your server/.env file.");
+  }
+
+  let lastErr;
+  for (const provider of candidates) {
+    try {
+      return provider === "gemma" ? await callGemma(pitchText) : await callGroq(pitchText);
+    } catch (err) {
+      lastErr = err;
+      console.warn(`LLM provider fallback: ${provider} failed: ${err.message}`);
+    }
+  }
+
+  throw lastErr || new Error("No LLM provider succeeded.");
+}
+
 const clampScore = (n) => {
   const x = Math.round(Number(n));
   return Number.isFinite(x) ? Math.min(100, Math.max(0, x)) : 50;
@@ -156,7 +296,10 @@ const cleanText = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
 
 /** Parse + validate + normalize the LLM output into a predictable shape. */
 function normalizeVerdictPayload(raw) {
-  const cleaned = raw.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  // Grab everything from the first "{" to the last "}" so code fences or stray text can't break parsing.
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  const cleaned = start !== -1 && end > start ? raw.slice(start, end + 1) : raw.trim();
   const parsed = JSON.parse(cleaned);
 
   if (!Array.isArray(parsed.judges)) throw new Error("`judges` is not an array");
@@ -201,16 +344,16 @@ function normalizeVerdictPayload(raw) {
   };
 }
 
-/** Call Groq, retrying once if the output fails validation. */
+/** Call the LLM, retrying once if the output fails validation. */
 async function generateJudgements(pitchText) {
   let lastErr;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const raw = await callGroq(pitchText);
+      const raw = await callLLM(pitchText);
       return normalizeVerdictPayload(raw);
     } catch (err) {
       lastErr = err;
-      if (err.source === "groq" && err.status) throw err; // don't retry HTTP errors (rate limits etc.)
+      if (err.status) throw err; // don't retry HTTP errors (rate limits, bad key, etc.)
       console.warn(`Judgement attempt ${attempt} failed: ${err.message}`);
     }
   }
@@ -274,8 +417,30 @@ async function attachAudio(judges) {
 // App
 // ─────────────────────────────────────────────────────────────
 const app = express();
+const DIST_DIR = path.join(__dirname, "..", "dist");
+
 app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
 app.use(express.json({ limit: "50kb" }));
+
+if (fs.existsSync(DIST_DIR)) {
+  app.use(express.static(DIST_DIR));
+}
+
+app.get("/", (_req, res) => {
+  if (fs.existsSync(path.join(DIST_DIR, "index.html"))) {
+    return res.sendFile(path.join(DIST_DIR, "index.html"));
+  }
+
+  return res.json({
+    ok: true,
+    message: "Pitch Court API is running.",
+    frontend: "Open http://localhost:5173 to use the app UI.",
+    endpoints: {
+      health: "/api/health",
+      judge: "POST /api/judge",
+    },
+  });
+});
 
 // Tiny in-memory rate limiter (per IP) so a demo crowd can't drain your free quota.
 const RATE_WINDOW_MS = 60_000;
@@ -295,8 +460,9 @@ function rateLimit(req, res, next) {
 app.get("/api/health", (_req, res) =>
   res.json({
     ok: true,
-    model: GROQ_MODEL,
-    groqKey: Boolean(GROQ_API_KEY),
+    provider: LLM_PROVIDER,
+    model: LLM_MODEL,
+    llmKey: Boolean(LLM_KEY),
     elevenLabsKey: Boolean(ELEVENLABS_API_KEY),
   })
 );
@@ -314,7 +480,7 @@ app.post("/api/judge", rateLimit, async (req, res) => {
       .status(400)
       .json({ error: `Pitch is too long. Keep it under ${MAX_PITCH_CHARS} characters.` });
   }
-  if (!GROQ_API_KEY || !ELEVENLABS_API_KEY) {
+  if (!LLM_KEY || !ELEVENLABS_API_KEY) {
     return res.status(500).json({ error: "Server is missing API keys. Check your .env file." });
   }
 
@@ -330,7 +496,8 @@ app.post("/api/judge", rateLimit, async (req, res) => {
       judges: judgesWithAudio,
       verdict,
       meta: {
-        model: GROQ_MODEL,
+        provider: LLM_PROVIDER,
+        model: LLM_MODEL,
         llmMs: tLLM - t0,
         ttsMs: tTTS - tLLM,
         audioComplete: judgesWithAudio.every((j) => j.audio),
@@ -338,14 +505,36 @@ app.post("/api/judge", rateLimit, async (req, res) => {
     });
   } catch (err) {
     console.error("/api/judge failed:", err.message);
-    if (err.source === "groq" && err.status === 429) {
+    const isLLMError = err.source === "groq" || err.source === "gemma";
+    if (isLLMError && err.status === 429) {
       return res.status(503).json({ error: "The judges are overwhelmed (rate limit). Try again shortly." });
+    }
+    if (isLLMError && (err.status === 401 || err.status === 403)) {
+      return res.status(500).json({ error: "The AI provider rejected the API key. Check your key in server/.env." });
+    }
+    if (isLLMError && (err.status === 400 || err.status === 404)) {
+      return res.status(500).json({
+        error: `The AI provider rejected the request (model "${LLM_MODEL}"). Check your API key and model name in server/.env.`,
+      });
     }
     res.status(500).json({ error: "The court has collapsed. Please try again." });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`⚖️  Pitch Court backend listening on http://localhost:${PORT}`);
-  console.log(`   LLM: ${GROQ_MODEL} | TTS: ${ELEVENLABS_MODEL}`);
-});
+function startServer(port = PORT) {
+  return app.listen(port, () => {
+    console.log(`⚖️  Pitch Court backend listening on http://localhost:${port}`);
+    console.log(`   LLM: ${LLM_PROVIDER} / ${LLM_MODEL} | TTS: ${ELEVENLABS_MODEL}`);
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  startServer,
+  generateJudgements,
+  normalizeVerdictPayload,
+};
